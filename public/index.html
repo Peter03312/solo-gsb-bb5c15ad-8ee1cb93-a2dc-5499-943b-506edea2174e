@@ -50,8 +50,39 @@
       </div>
     </section>
 
+    <section class="card" id="sec-exclusions">
+      <h2>3. 避邻对（同对两管不得相邻）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        部分离心管不能占据相邻孔位：环形孔位中孔 <b>i</b> 与孔 <b>(i+1)%N</b> 相邻，
+        同一避邻对的两管不得相邻。按管编号维护；未知编号、自配对、重复配对（含颠倒）
+        整次拒绝，不留下部分数据。删除仍被避邻对引用的离心管会被拒绝并保留原数据，
+        须先删除对应避邻对。规则变化会使旧草稿与旧发布图不可用于当前装载（历史图不改写）；
+        未配置规则时，录入、发布、预约、核验流程与旧图可用性判定均不受影响。
+      </div>
+      <div class="form-row">
+        <label>离心管 A
+          <select id="ex-a"></select>
+        </label>
+        <label>离心管 B
+          <select id="ex-b"></select>
+        </label>
+        <button id="ex-add">＋ 添加避邻对</button>
+      </div>
+      <div class="table-wrap">
+        <table id="ex-table">
+          <thead>
+            <tr><th>离心管 A</th><th>离心管 B</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="save-exclusions" class="primary">保存避邻对并配平</button>
+      </div>
+    </section>
+
     <section class="card" id="sec-weights">
-      <h2>3. 可选配重块</h2>
+      <h2>4. 可选配重块</h2>
       <div class="table-wrap">
         <table id="weights-table">
           <thead>
@@ -67,7 +98,7 @@
     </section>
 
     <section class="card" id="sec-draft">
-      <h2>4. 可行装载图（草稿）</h2>
+      <h2>5. 可行装载图（草稿）</h2>
       <div id="draft-stale" class="banner warn hidden">
         称重质量或配重数量已变化，此草稿基于旧数据，须点击「按当前数据重算」。
       </div>
@@ -80,12 +111,12 @@
     </section>
 
     <section class="card" id="sec-pubs">
-      <h2>5. 已发布装载图</h2>
+      <h2>6. 已发布装载图</h2>
       <div id="pub-list"></div>
     </section>
 
     <section class="card" id="sec-verify">
-      <h2>6. 现场装载核验</h2>
+      <h2>7. 现场装载核验</h2>
       <div class="muted" style="margin-bottom:10px">
         选择上方「✓ 可用于当前装载」的发布记录，按孔位录入实际物件编号与实测质量（有限正数）；
         空孔保持为空、质量 0。可随时暂存并恢复；同一发布记录只保留一份未完成核验。
@@ -94,7 +125,7 @@
     </section>
 
     <section class="card" id="sec-reserve">
-      <h2>7. 配重块时段预约</h2>
+      <h2>8. 配重块时段预约</h2>
       <div class="muted" style="margin-bottom:10px">
         以批次号预约「✓ 可用于当前装载」发布图所需的配重块；时段按 UTC
         <b>左闭右开 [开始, 结束)</b> 计算，任一时刻同规格预约总量不得超过当前录入的可选数量。
@@ -125,7 +156,7 @@
     </section>
 
     <section class="card" id="sec-suspend">
-      <h2>8. 配重块临时停用</h2>
+      <h2>9. 配重块临时停用</h2>
       <div class="muted" style="margin-bottom:10px">
         按质量规格登记停用数量、原因与 UTC 起止时间，时段按
         <b>左闭右开 [开始, 结束)</b> 计算；同规格重叠停用量累加，任一时刻不得超过登记时

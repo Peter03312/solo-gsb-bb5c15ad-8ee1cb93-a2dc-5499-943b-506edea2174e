@@ -33,6 +33,8 @@ import {
   listActiveSuspensions,
   insertSuspension,
   revokeSuspension,
+  getExclusions,
+  replaceExclusions,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -50,6 +52,7 @@ import {
   validateConfig,
   validateTubes,
   validateWeights,
+  validateExclusions,
 } from './validate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -112,6 +115,9 @@ export function createApp(db) {
   });
 
   // ---------- 离心管（整表替换，事务） ----------
+  //
+  // 替换后若仍有避邻对指向被删除的编号（失效避邻对），整次拒绝并保留原数据；
+  // 须先删除对应避邻对（PUT /api/exclusions）再替换离心管。
 
   app.put('/api/tubes', (req, res, next) => {
     try {
@@ -119,6 +125,18 @@ export function createApp(db) {
         const current = loadData(db);
         const N = current ? current.holes : null;
         const clean = validateTubes(body, N);
+        const newIds = new Set(clean.map((t) => t.id));
+        const dangling = getExclusions(db).filter(
+          (p) => !newIds.has(p.a) || !newIds.has(p.b),
+        );
+        if (dangling.length > 0) {
+          throw new ValidationError([
+            '本次替换会使以下避邻对失效（指向不再存在的离心管编号），已整次拒绝并保留原数据：',
+            ...dangling.map(
+              (p) => `避邻对「${p.a} ↔ ${p.b}」：请先删除该避邻对，或保留对应离心管编号`,
+            ),
+          ]);
+        }
         db.prepare('DELETE FROM tube_holes').run();
         db.prepare('DELETE FROM tubes').run();
         const insTube = db.prepare('INSERT INTO tubes (id, mass, ord) VALUES (?, ?, ?)');
@@ -130,6 +148,32 @@ export function createApp(db) {
       });
       tx(req.body);
       res.json({ ok: true, currentHash: currentHash(db) });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 避邻对（整体替换，事务） ----------
+  //
+  // 操作者按管编号维护「不得相邻」的离心管对：环形孔位中孔 i 与 (i+1)%N 相邻，
+  // 同对两管不得占据相邻孔位。未知编号、自配对、重复配对（含颠倒）整次拒绝，
+  // 事务回滚不留部分数据。规则随数据指纹生效：规则变化使旧草稿/旧发布图
+  // 不可用于当前装载（历史图不改写）；未配置规则时各流程与旧图判定不受影响。
+
+  app.get('/api/exclusions', (req, res) => {
+    res.json(getExclusions(db));
+  });
+
+  app.put('/api/exclusions', (req, res, next) => {
+    try {
+      let clean;
+      const tx = db.transaction((body) => {
+        const data = loadData(db);
+        clean = validateExclusions(body, data);
+        replaceExclusions(db, clean);
+      });
+      tx(req.body);
+      res.json({ ok: true, exclusions: clean, currentHash: currentHash(db) });
     } catch (e) {
       next(e);
     }

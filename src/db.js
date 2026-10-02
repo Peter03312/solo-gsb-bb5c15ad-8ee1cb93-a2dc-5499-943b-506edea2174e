@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS weights (
   quantity INTEGER NOT NULL
 );
 
+-- 离心管避邻对：同对两管不得占据相邻孔位（环形孔位 i 与 (i+1)%N 相邻）。
+-- 按管编号引用，规范化存储（tube_a < tube_b），随数据指纹一并生效：
+-- 规则变化会改变数据指纹，使旧发布图不可用于当前装载（历史图不改写）。
+-- 不设外键：离心管整表替换由应用层在事务内校验「不得留下失效避邻对」。
+CREATE TABLE IF NOT EXISTS exclusions (
+  tube_a TEXT NOT NULL,
+  tube_b TEXT NOT NULL,
+  PRIMARY KEY (tube_a, tube_b),
+  CHECK (tube_a <> tube_b)
+);
+
 CREATE TABLE IF NOT EXISTS drafts (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   basis_hash TEXT NOT NULL,
@@ -147,7 +158,23 @@ export function loadData(db) {
     holeMaxMass,
     tubes,
     weights,
+    exclusions: getExclusions(db),
   };
+}
+
+// ---------- 离心管避邻对 ----------
+
+export function getExclusions(db) {
+  return db
+    .prepare('SELECT tube_a AS a, tube_b AS b FROM exclusions ORDER BY tube_a, tube_b')
+    .all();
+}
+
+// 整体替换（由 server 在单事务内调用；校验失败即回滚，不留部分数据）
+export function replaceExclusions(db, pairs) {
+  db.prepare('DELETE FROM exclusions').run();
+  const ins = db.prepare('INSERT INTO exclusions (tube_a, tube_b) VALUES (?, ?)');
+  for (const p of pairs) ins.run(p.a, p.b);
 }
 
 export function currentHash(db) {

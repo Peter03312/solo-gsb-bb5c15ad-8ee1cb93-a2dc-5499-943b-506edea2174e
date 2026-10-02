@@ -14,6 +14,8 @@ let state = null; // GET /api/state 的完整响应
 let editorN = null;
 let tubeRows = []; // {id, mass, holes:Set}
 let weightRows = []; // {mass, quantity}
+let exclRows = []; // {a, b}（a < b，已规范化）
+let exclBasis = ''; // 上次从服务端载入的避邻对快照（用于判断是否需要重建编辑缓冲）
 
 // ---------- 通用 ----------
 
@@ -78,6 +80,7 @@ function renderAll() {
   renderHoleMax(d);
   renderTubeTable(N);
   renderWeightTable();
+  renderExclusions(d);
   renderDraft();
   renderPublications();
   renderVerifications();
@@ -218,6 +221,83 @@ $('#add-weight').addEventListener('click', () => {
   if (!editorN) return showAlert('请先保存转子配置（孔位数）。', 'err');
   weightRows.push({ mass: '', quantity: 1 });
   renderWeightTable();
+});
+
+// ---------- 避邻对 ----------
+
+function renderExclusions(d) {
+  const tubes = (d && d.tubes) || [];
+  const saved = (d && d.exclusions) || [];
+  // 已保存规则变化时重建本地编辑缓冲（未保存的本地修改随之放弃）
+  const savedKey = JSON.stringify(saved);
+  if (savedKey !== exclBasis) {
+    exclBasis = savedKey;
+    exclRows = saved.map((p) => ({ a: p.a, b: p.b }));
+  }
+
+  // 管编号下拉（A/B 两个选择器）
+  for (const sel of [$('#ex-a'), $('#ex-b')]) {
+    const prev = sel.value;
+    sel.innerHTML = tubes.length
+      ? tubes.map((t) => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.id)}</option>`).join('')
+      : '<option value="">（请先在第 2 节录入离心管）</option>';
+    if (tubes.some((t) => t.id === prev)) sel.value = prev;
+  }
+
+  const tbody = $('#ex-table tbody');
+  tbody.innerHTML = '';
+  if (exclRows.length === 0) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 3;
+    td.className = 'muted';
+    td.textContent = '未配置避邻对：所有流程按无避邻规则运行。';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  exclRows.forEach((row, i) => {
+    const tr = document.createElement('tr');
+    const tdA = document.createElement('td');
+    tdA.textContent = row.a;
+    const tdB = document.createElement('td');
+    tdB.textContent = row.b;
+    const tdDel = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'danger';
+    del.textContent = '删除';
+    del.addEventListener('click', () => {
+      exclRows.splice(i, 1);
+      renderExclusions(state.data);
+    });
+    tdDel.appendChild(del);
+    tr.append(tdA, tdB, tdDel);
+    tbody.appendChild(tr);
+  });
+}
+
+$('#ex-add').addEventListener('click', () => {
+  const a = $('#ex-a').value.trim();
+  const b = $('#ex-b').value.trim();
+  if (!a || !b) return showAlert('请选择两支离心管。', 'err');
+  if (a === b) return showAlert(`自配对无效：「${a}」不能与自身配对。`, 'err');
+  const [x, y] = a < b ? [a, b] : [b, a];
+  if (exclRows.some((p) => p.a === x && p.b === y)) {
+    return showAlert(`避邻对「${x} ↔ ${y}」已存在（重复配对，含颠倒顺序）。`, 'err');
+  }
+  exclRows.push({ a: x, b: y });
+  exclRows.sort((p, q) => (p.a < q.a ? -1 : p.a > q.a ? 1 : p.b < q.b ? -1 : 1));
+  renderExclusions(state.data);
+});
+
+$('#save-exclusions').addEventListener('click', async () => {
+  try {
+    await api('PUT', '/api/exclusions', exclRows);
+    const r = await api('POST', '/api/solve');
+    await refresh();
+    if (r.feasible) showAlert('避邻对已保存，装载图已按当前数据与避邻规则重算。', 'ok');
+    else showAlert('避邻对已保存，但不存在可行装载图：\n' + r.reasons.join('\n'), 'err');
+  } catch (e) { showAlert(e.message, 'err'); }
 });
 
 // ---------- 保存动作 ----------
@@ -396,11 +476,17 @@ async function openPublication(id) {
   const badge = p.usable
     ? '<span class="badge ok">✓ 可用于当前装载</span>'
     : '<span class="badge stale">✗ 不可用于当前装载</span>';
+  const frozenExcl = (p.config && p.config.exclusions) || [];
   $('#pub-detail').innerHTML = `
     <div class="actions" style="margin-top:0">${badge}
       <span class="muted">发布时间 ${p.createdAt}</span></div>
     <p class="muted" style="font-family:ui-monospace,monospace;font-size:12px">
       数据依据 sha256:${p.basisHash}</p>
+    ${frozenExcl.length
+      ? `<p class="muted">冻结避邻对：${frozenExcl
+          .map((x) => `${escapeHtml(x.a)} ↔ ${escapeHtml(x.b)}`)
+          .join('、')}（同对两管不得相邻）</p>`
+      : ''}
     ${p.feasible
       ? `<div class="metrics">
           <div>配重块：<b>${p.weightCount}</b> 枚</div>
@@ -429,7 +515,7 @@ function renderVerifications() {
   const list = state.verifications || [];
   if (list.length === 0) {
     box.innerHTML =
-      '<div class="muted">尚无核验记录。在第 5 节对可用于当前装载的发布记录点「现场核验此图」即可开始。</div>';
+      '<div class="muted">尚无核验记录。在第 6 节对可用于当前装载的发布记录点「现场核验此图」即可开始。</div>';
     return;
   }
   box.innerHTML = list
@@ -897,7 +983,7 @@ function renderSuspensions() {
     ? weights
         .map((w) => `<option value="${w.mass}">${fmt(w.mass)} g（库存 ${w.quantity} 枚）</option>`)
         .join('')
-    : '<option value="">（请先在第 3 节录入配重规格）</option>';
+    : '<option value="">（请先在第 4 节录入配重规格）</option>';
   if (weights.some((w) => String(w.mass) === prev)) sel.value = prev;
 
   const box = $('#sus-list');

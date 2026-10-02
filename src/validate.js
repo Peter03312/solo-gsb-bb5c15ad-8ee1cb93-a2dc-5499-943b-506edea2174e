@@ -148,3 +148,57 @@ export function validateWeights(input, N) {
   if (errors.length) throw new ValidationError(errors);
   return normalized;
 }
+
+// 避邻对整体替换校验：未知编号、自配对、重复配对（含颠倒）均整次拒绝。
+// 返回规范化列表 [{a, b}]（a < b，按字典序排序），供事务内整体替换。
+export function validateExclusions(input, data) {
+  const errors = [];
+  assert(Array.isArray(input), errors, '避邻对列表必须是数组（每项含 a、b 两个管编号）');
+  if (!Array.isArray(input)) throw new ValidationError(errors);
+
+  const tubeIds = new Set(
+    (data && Array.isArray(data.tubes) ? data.tubes : []).map((t) => t.id),
+  );
+  const seen = new Set();
+  const normalized = [];
+
+  input.forEach((row, i) => {
+    const where = `第 ${i + 1} 对避邻规则`;
+    assert(row !== null && typeof row === 'object', errors, `${where}格式不正确（必须是对象）`);
+    if (!row || typeof row !== 'object') return;
+
+    const a = typeof row.a === 'string' ? row.a.trim() : '';
+    const b = typeof row.b === 'string' ? row.b.trim() : '';
+    assert(a.length > 0, errors, `${where}的 a 编号不能为空`);
+    assert(b.length > 0, errors, `${where}的 b 编号不能为空`);
+    if (!a || !b) return;
+
+    if (a === b) {
+      errors.push(`${where}「${a}」与自身配对无效（自配对不允许）`);
+      return;
+    }
+    const unknown = [];
+    if (!tubeIds.has(a)) unknown.push(a);
+    if (!tubeIds.has(b)) unknown.push(b);
+    if (unknown.length > 0) {
+      errors.push(
+        `${where}包含未知离心管编号 ${unknown.map((u) => `「${u}」`).join('、')}（当前录入中不存在）`,
+      );
+      return;
+    }
+    const x = a < b ? a : b;
+    const y = a < b ? b : a;
+    if (seen.has(`${x} ${y}`)) {
+      errors.push(`避邻对「${x} ↔ ${y}」重复（含颠倒顺序的重复配对）`);
+      return;
+    }
+    seen.add(`${x} ${y}`);
+    normalized.push({ a: x, b: y });
+  });
+
+  if (errors.length) throw new ValidationError(errors);
+  normalized.sort((p, q) =>
+    p.a < q.a ? -1 : p.a > q.a ? 1 : p.b < q.b ? -1 : p.b > q.b ? 1 : 0,
+  );
+  return normalized;
+}
