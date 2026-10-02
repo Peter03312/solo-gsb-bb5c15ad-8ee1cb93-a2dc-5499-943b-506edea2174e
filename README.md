@@ -1,0 +1,359 @@
+# 离心转子配平（Rotor Balance）
+
+实验室离心转子装载配平 Web 应用：录入转子参数、本次离心管称重数据与可选配重块，
+系统按约束求**可行装载图**，优化目标依次为：
+
+1. **配重块使用数量最少**；
+2. **各对对径孔质量差之和最小**；
+3. 目标完全相同时，按**孔位编号对应的物件编号序列字典序取小**
+   （次序约定：离心管编号 → 配重块 `质量组#组内序号` → 空孔；即小编号离心管优先占据低编号孔位）。
+
+无解时明确列出原因。发布时在**单个数据库事务**内重读当前数据、重新求解并用独立校验器复核，
+通过后冻结装载图及其数据依据（哈希）。此后录入数据的任何修改**不会改动旧图**，
+但旧图会被标记为「**不可用于当前装载**」。
+
+现场可对**仍可用于当前装载**的发布记录做**装载核验**：按孔位录入实际物件编号与实测质量
+（有物件为有限正数，空孔留空、质量 0），可暂存/恢复，携带版本号防止并发覆盖；
+完成时在**单个数据库事务**内重读发布快照与当前数据，逐孔核对物件与承重、逐对核对径差
+以及发布记录的当前可用性，通过后冻结实测值、判定明细与发布编号。
+
+实验室在不同时段复用配重块：操作者凭**批次号 + 当前可用的已发布装载图 + UTC 起止时间**
+预约配重块（起点须早于终点，非法时间或未知图一律拒绝）。时段按**左闭右开** `[start, end)`
+计算，占用量按**冻结图**统计到各质量规格；创建预约在**单个数据库事务**内原子重读冻结图、
+当前库存、重叠的生效中预约**与重叠的生效停用**——任一时刻同规格「预约占用 + 临时停用」
+总量不得超过当前录入数量，不足时返回**冲突规格与时段**且**不产生任何部分占用**。批次号为幂等键：
+同号同内容重复提交返回原记录，同号不同内容拒绝；**仅未开始的预约可取消**，取消后保留历史
+且同号重试不重新占用。录入数量减少或图失效**不改写既有预约**，后续预约仍按当前数量与图可用性
+判定，预约日程中展示已有占用、停用量及「占用」「占用 + 停用」两类不足区段。
+
+配重块需要**临时停用**（送检、损坏等）时按**质量规格**登记停用数量、原因与 UTC 起止时间
+（左闭右开）；同规格重叠时段的停用量**累加**，任一时刻停用量不得超过**登记时**该规格的
+当前数量，超量/非法时间/非法数量/未知规格一律拒绝且**不留记录**。停用登记后立即影响
+**新预约**的可用量（既有预约不改写，停用允许与既有预约重叠）；**仅未开始的停用可撤销**，
+撤销保留历史并立即释放后续容量。
+
+## 约束模型
+
+- 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径。
+- 每孔**最多一件**物件（一支离心管或一枚配重块），空孔质量按 0 计。
+- 全部离心管**必须装入**；每枚配重块**最多使用一次**。
+- 任一孔内物件质量不得超过该孔最大承重；离心管只能放入其声明的可用孔位。
+- 每对对径孔的质量差不得超过允许对径差（容差）。
+- 非法质量（非数、≤0 等）、重复编号、孔位越界一律拒绝，**不留下任何部分数据**
+  （整表替换在一个 SQLite 事务中完成，校验失败即回滚）。
+
+求解算法：按对径孔对逐对做动态规划（状态 = 已用离心管位图 + 各配重组已用数量），
+同状态只保留目标三元组最优的路径（Pareto 保优），规模上界 N=12。
+
+## 一键启动（Docker Compose）
+
+前置要求：已安装 Docker 与 Docker Compose 插件。
+
+```bash
+docker compose up --build -d
+```
+
+首次启动会自动：
+
+1. 安装全部依赖（容器内编译 better-sqlite3 原生模块）；
+2. 初始化 SQLite 数据库与全部表结构（服务启动时自动建表，无需手工脚本）。
+
+访问地址：
+
+- **http://localhost:8080** （浏览器界面）
+
+停止 / 查看日志：
+
+```bash
+docker compose down        # 停止（数据卷保留）
+docker compose logs -f     # 查看日志
+```
+
+数据持久化在命名卷 `rotor-data`（容器内 `/app/data/rotor.db`）。
+如需彻底清空：`docker compose down -v`。
+
+## 本地直接运行（不使用 Docker）
+
+需要 Node.js ≥ 20；better-sqlite3 为原生模块，首次安装需要 Python 3 / make / g++。
+
+```bash
+npm install
+npm start
+```
+
+运行测试：
+
+```bash
+npm test
+```
+
+## 配置项（环境变量）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORT` | `8080` | HTTP 监听端口（容器内）；Compose 中可用同名变量改主机映射端口，如 `PORT=9090 docker compose up -d` |
+| `HOST` | `0.0.0.0` | 监听地址 |
+| `DB_PATH` | `./data/rotor.db`（本地）/ `/app/data/rotor.db`（容器） | SQLite 数据库文件路径，目录不存在会自动创建 |
+
+## 使用流程
+
+1. **转子配置**：选择孔位数（4–12 偶数）、允许对径差（g）、各孔最大承重，保存。
+2. **离心管**：逐行录入编号、称重质量、可用孔位（勾选），保存后自动配平。
+3. **配重块**：按“质量 + 数量”录入每种可选配重规格（同质量自动归为一组），保存后自动配平。
+4. **装载图草稿**：保存任一类数据后自动重算；称重或配重数据变化后，旧草稿显示
+   「基于旧数据」警示且**禁止直接发布**，须点「按当前数据重算」。
+5. **发布**：点「发布并冻结」。服务端在事务内重新读取当前数据 → 重新求解 →
+   独立复核（承重、容差、管全装入、配重不超量、孔位可用、质量一致）→ 写入冻结记录。
+   无解时拒绝发布并给出原因。
+6. **已发布装载图**：列表中每条记录带状态徽标：
+   - ✓ 可用于当前装载：记录的数据指纹与当前录入完全一致；
+   - ✗ 不可用于当前装载：录入数据已变化；旧图内容保持冻结不变，可点开查看其当时的数据快照。
+   仅「✓ 可用于当前装载」的可行发布记录可点「现场核验此图」发起核验。
+7. **现场装载核验**：
+   1. 点「现场核验此图」建立核验草稿（空孔初始化，同一发布记录只保留一份草稿；
+      已完成核验的发布记录不能再建）。
+   2. 在弹窗中按孔位录入**实际物件编号**与**实测质量**（有物件必须是有限正数；
+      空孔保持为空、质量为 0）。页面实时显示「已录入 / 应录入孔数」进度。
+   3. 可随时「暂存录入」后中断，稍后从核验列表恢复；每次暂存版本号 +1，
+      提交过期版本会被 409 拒绝，避免覆盖他人的修改。
+   4. 「完成核验」在服务端**同一事务**内重读冻结发布快照与当前录入数据，判定：
+      - 各孔实际物件编号与冻结图完全一致（不一致定位到**孔位**）；
+      - 实测质量不超过该孔最大承重（超重定位到**孔位**）；
+      - 各对径孔实测质量差不超过**冻结容差**（超限定位到**孔对**）；
+      - 发布记录仍可用于当前装载（数据指纹一致）。
+      
+      任一不通过：弹窗列出原因并在表中高亮对应孔位/孔对，**草稿保留、不生成完成记录**。
+   5. 核验通过后**冻结**实测值、逐孔/逐对判定明细与发布编号；重复完成幂等返回同一份结果，
+      不再产生第二份；此后再修改录入会被拒绝，已完成核验不被改写。
+7. **配重块时段预约**（第 7 节）：
+   1. 选择「✓ 可用于当前装载」的发布图，填写批次号与 UTC 起止时间（页面输入按 UTC 解释），
+      提交预约。占用量按冻结图统计（如 `50 g × 1`）。
+   2. 时段按左闭右开计算：前一条的终点与后一条的起点相接时互不冲突。
+   3. 数量不足时页面列出冲突规格与时段（既有占用、本次需求、当前可选数量），
+      本次预约不产生任何占用。
+   4. 同批次号同内容重复提交返回原记录（已取消的亦返回原取消记录，不重新占用）；
+      同号不同内容被拒绝。
+   5. 仅未开始的预约可「取消预约」；取消后历史保留、占用释放。
+   6. 「占用日程」按当前录入数量展示各规格的分段占用与停用；数量减少或图失效后，
+      既有预约保持不变，超出当前数量的区段按两种口径标记「不足」：
+      - 预约占用本身超过当前库存（`shortage`，字段含义与往期一致）；
+      - 预约占用加临时停用超过当前库存（`combinedShortage`）。
+8. **配重块临时停用**（第 8 节）：
+   1. 选择当前录入的质量规格，填写停用数量（正整数）、原因与 UTC 起止时间后提交。
+      时段同样按左闭右开计算；同规格重叠停用量累加，任一时刻不得超过登记时该规格库存。
+   2. 非法时间、非法数量、未知规格或超量停用一律拒绝，**不留下任何记录**；
+      超量时 409 响应给出冲突规格与时段（`detail.conflicts[].windows`）。
+   3. 停用登记后立即影响**新预约**：创建预约的同一事务内同时核对当前库存、重叠的生效
+      停用与已有预约，任一时刻「占用 + 停用」超出库存则整单拒绝。
+   4. 停用允许与既有预约重叠，**既有预约不改写**；占用日程同时展示停用量与
+      「占用 + 停用」合计不足区段（仅「占用超库存」的旧字段含义保持不变）。
+   5. 仅**未开始**的停用可「撤销停用」；撤销后历史保留（状态 `revoked`），
+      后续容量立即释放；已撤销重复调用幂等返回原记录，已开始/已结束的停用返回 409。
+
+## REST API 摘要
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/state` | 当前录入数据、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表 |
+| PUT | `/api/config` | 整体替换转子配置（孔位数、容差、各孔最大承重），事务 |
+| PUT | `/api/tubes` | 整体替换全部离心管，事务，校验失败回滚 |
+| PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚 |
+| POST | `/api/solve` | 按当前数据重算草稿 |
+| POST | `/api/publish` | 事务内求解 + 独立复核 + 冻结发布；无解返回 400 |
+| GET | `/api/publications` | 发布记录列表（含当前可用性标记） |
+| GET | `/api/publications/:id` | 单条冻结记录详情（含发布时数据快照） |
+| POST | `/api/verifications` | 对当前可用的发布记录建立核验草稿（同一发布仅一份）；重复返回 409 + `existingId` |
+| GET | `/api/verifications` | 核验列表（进度、版本、是否完成、依据发布当前是否可用） |
+| GET | `/api/verifications/:id` | 核验详情（冻结快照、暂存/冻结录入；完成后附判定明细） |
+| PUT | `/api/verifications/:id` | 暂存孔位录入（整表替换），须携带 `version`；过期返回 409 |
+| POST | `/api/verifications/:id/complete` | 事务内重读快照与当前数据完成判定；不通过 400（原因定位孔位/孔对，草稿保留）；重复完成幂等 200 |
+| POST | `/api/reservations` | 创建配重块时段预约（批次号 + 可用发布图 + UTC 起止，左闭右开）；事务内原子重读图/当前库存/重叠预约/**重叠停用**；201 新建、200 幂等重放、400 非法输入或图不可用、409 批次冲突或「占用+停用」超库存（附冲突规格与时段） |
+| GET | `/api/reservations` | 预约列表（含状态、阶段、依据图当前可用性、各规格占用） |
+| GET | `/api/reservations/:id` | 单条预约详情 |
+| POST | `/api/reservations/:id/cancel` | 取消预约（仅未开始）；已取消幂等返回原记录；已开始 409 |
+| POST | `/api/suspensions` | 登记配重块临时停用（质量规格 + 正整数数量 + 原因 + UTC 起止，左闭右开）；事务内重读当前库存与重叠生效停用，超量拒绝不留记录；201 新建、400 非法输入/未知规格、409 超量（附冲突规格与时段） |
+| GET | `/api/suspensions` | 停用列表（含状态、阶段 `notStarted/ongoing/ended/revoked`、是否可撤销、原因与撤销时间；含已撤销历史） |
+| GET | `/api/suspensions/:id` | 单条停用详情 |
+| POST | `/api/suspensions/:id/revoke` | 撤销停用（仅未开始）；已撤销幂等返回原记录；已开始/已结束 409；撤销后立即释放后续容量 |
+| GET | `/api/schedule?from=&to=` | 日程：各质量规格在时段内的预约占用分段（`segments`，占用超库存 `shortage`）、停用分段（`suspendedSegments`）与「占用+停用」合计分段（`combinedSegments`，合计超库存 `shortage` / 规格级 `combinedShortage`）；from/to 缺省为覆盖全部生效中预约与停用 |
+
+错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
+预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
+核验完成失败时 400 响应的 `detail.checks` 内带逐孔（`objectMatch`、`withinCapacity`）与
+逐对（`withinTolerance`）判定，可直接用于前端高亮定位；预约数量不足（含停用占用）时 409
+响应的 `detail.conflicts` 内带冲突规格、当前库存与超限时段（`windows`，含 `used` 预约占用
+与 `suspended` 停用量）；停用登记超量时 409 响应结构相同（`windows[].suspended` 为已停用
+数量），均可直接用于日程定位。
+
+## 现场核验 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 查看可用发布记录（usable=true 才可发起核验）
+curl -s $BASE/api/publications
+
+# 2) 对发布记录 #1 建立核验草稿（重复建立返回 409，body 中含 existingId，可直接恢复）
+curl -s -X POST $BASE/api/verifications \
+  -H 'Content-Type: application/json' \
+  -d '{"publicationId":1}'
+# -> {"id":1,"version":1,"completed":false,"progress":{"filled":0,"total":2},
+#     "entries":[{"hole":0,"ref":"","mass":0}, ...], "publication":{...冻结快照...}}
+
+# 3) 按孔位暂存（空孔 ref:""、mass:0；有物件 ref 为编号、mass 为有限正数）
+#    entries 也可写成稀疏形式 [{"hole":0,"ref":"A","mass":50.1}, ...]
+curl -s -X PUT $BASE/api/verifications/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"entries":[
+        {"hole":0,"ref":"A","mass":50.1},
+        {"hole":1,"ref":"","mass":0},
+        {"hole":2,"ref":"B","mass":50.4},
+        {"hole":3,"ref":"","mass":0}]}'
+# -> {"version":2,"progress":{"filled":2,"total":2}, ...}
+# 并发覆盖时：HTTP 409 {"errors":[...],"currentVersion":2}
+
+# 4) 完成核验（事务内重读发布快照 + 当前数据指纹；不通过返回 400 且草稿保留）
+curl -s -X POST $BASE/api/verifications/1/complete
+# 201（首次通过）/ 200（重复完成，幂等返回冻结结果）
+# -> {"completed":true,"completedAt":"...","frozenEntries":[...],
+#     "diffSum":0.3,"checks":{"holes":[{hole,expectedRef,actualRef,
+#        measuredMass,objectMatch,withinCapacity}...],
+#        "pairs":[{a,b,massA,massB,diff,withinTolerance}...]}}
+
+# 5) 不通过示例：原因定位孔位/孔对，草稿仍可 GET 恢复
+# HTTP 400 {"errors":["核验不通过…：","孔 0 物件不一致：…","对径孔对（0 ↔ 2）…"],
+#           "detail":{"version":2,"checks":{...}}}
+
+# 6) 核验列表 / 单条恢复
+curl -s $BASE/api/verifications
+curl -s $BASE/api/verifications/1
+```
+
+## 配重块时段预约 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 创建预约：批次号 + 当前可用发布图 + UTC 起止（左闭右开 [start, end)）
+#    占用量按冻结图统计；201 新建成功
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-001","publicationId":1,
+       "startUtc":"2026-10-03T08:00:00Z","endUtc":"2026-10-03T12:00:00Z"}'
+# -> {"id":1,"batchNo":"BATCH-001","publicationId":1,
+#     "startUtc":"2026-10-03T08:00:00.000Z","endUtc":"2026-10-03T12:00:00.000Z",
+#     "usage":[{"mass":50,"count":1}],"status":"active","phase":"notStarted",
+#     "cancellable":true,"publicationUsable":true,...}
+
+# 2) 幂等：同批次号同内容重复提交 → 200 返回原记录（不产生新占用）；
+#    同批次号不同内容 → 409 {"existingId":1}
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-001","publicationId":1,
+       "startUtc":"2026-10-03T08:00:00Z","endUtc":"2026-10-03T12:00:00Z"}'
+
+# 3) 数量不足：409，detail.conflicts 给出冲突规格与时段，不产生任何部分占用
+#    windows 内 used 为既有预约占用、suspended 为同时段临时停用数量
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-002","publicationId":1,
+       "startUtc":"2026-10-03T10:00:00Z","endUtc":"2026-10-03T14:00:00Z"}'
+# -> 409 {"errors":["当前可用数量不足（预约占用 + 生效停用超出当前库存），预约未产生任何占用：",
+#                   "规格 50 g：2026-10-03T10:00:00.000Z 至 2026-10-03T12:00:00.000Z
+#                    已预约占用 1 枚、临时停用 0 枚，本次需 1 枚，合计超出当前库存 1 枚"],
+#         "detail":{"conflicts":[{"mass":50,"required":1,"capacity":1,"peak":1,
+#                    "peakSuspended":0,
+#                    "windows":[{"start":"...","end":"...","used":1,"suspended":0}]}]}}
+
+# 4) 左闭右开：与既有预约终点相接的起点不冲突 → 201
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-002","publicationId":1,
+       "startUtc":"2026-10-03T12:00:00Z","endUtc":"2026-10-03T14:00:00Z"}'
+
+# 5) 取消：仅未开始的预约可取消；已取消重复调用幂等返回原记录；
+#    取消后同批次号同内容重试仍返回该取消记录（不重新占用）
+curl -s -X POST $BASE/api/reservations/2/cancel
+
+# 6) 预约列表 / 单条 / 日程（from/to 可省略，缺省覆盖全部生效中预约与停用）
+curl -s $BASE/api/reservations
+curl -s $BASE/api/reservations/1
+curl -s "$BASE/api/schedule?from=2026-10-03T00:00:00Z&to=2026-10-04T00:00:00Z"
+# -> {"from":"...","to":"...","specs":[{
+#      "mass":50,"capacity":1,"peak":1,"shortage":false,
+#      "peakSuspended":1,"peakCombined":2,"combinedShortage":true,
+#      "segments":[{"start":"...","end":"...","used":1,"suspended":0,"shortage":false}],
+#      "suspendedSegments":[{"start":"...","end":"...","suspended":1}],
+#      "combinedSegments":[{"start":"...","end":"...","used":1,"suspended":1,
+#                           "shortage":true}]}]}
+#    说明：segments.shortage 仅表示「预约占用 > 当前库存」（旧字段含义不变）；
+#    combinedSegments.shortage 表示「预约占用 + 停用 > 当前库存」。
+#    录入数量减少后：既有预约/停用不变，capacity 随之下降，超限区段 shortage=true。
+```
+
+## 配重块临时停用 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 登记停用：质量规格（须为当前录入规格）+ 正整数数量 + 原因 + UTC 起止（左闭右开）
+#    同规格重叠停用量累加；任一时刻不得超过登记时该规格当前库存
+curl -s -X POST $BASE/api/suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"mass":50,"quantity":1,"reason":"送检校准",
+       "startUtc":"2026-10-05T08:00:00Z","endUtc":"2026-10-05T12:00:00Z"}'
+# -> 201 {"id":1,"mass":50,"quantity":1,"reason":"送检校准",
+#         "startUtc":"2026-10-05T08:00:00.000Z","endUtc":"2026-10-05T12:00:00.000Z",
+#         "status":"active","phase":"notStarted","revocable":true,
+#         "createdAt":"...","revokedAt":null}
+
+# 2) 登记后立即影响新预约：与停用重叠且「占用 + 停用 > 库存」的预约整单拒绝
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-S1","publicationId":1,
+       "startUtc":"2026-10-05T10:00:00Z","endUtc":"2026-10-05T11:00:00Z"}'
+# -> 409 detail.conflicts[].windows[0] = {"start":"2026-10-05T10:00:00.000Z",
+#    "end":"2026-10-05T11:00:00.000Z","used":0,"suspended":1}
+
+# 3) 停用允许与既有预约重叠（既有预约不改写）；停用登记本身不核对预约占用，
+#    只核对「重叠停用量 ≤ 当前库存」。
+
+# 4) 非法输入与未知规格 → 400；超量停用 → 409（附冲突时段，且不留下任何记录）
+curl -s -X POST $BASE/api/suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"mass":77,"quantity":1,"reason":"未知规格",
+       "startUtc":"2026-10-05T08:00:00Z","endUtc":"2026-10-05T09:00:00Z"}'
+# -> 400 {"errors":["未知质量规格 77 g：当前配重块录入中不存在该规格，不能登记停用"]}
+curl -s -X POST $BASE/api/suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"mass":50,"quantity":99,"reason":"超量",
+       "startUtc":"2026-10-05T08:00:00Z","endUtc":"2026-10-05T09:00:00Z"}'
+# -> 409 {"errors":[...],
+#         "detail":{"conflicts":[{"mass":50,"required":99,"capacity":1,"peak":0,
+#                    "windows":[{"start":"...","end":"...","suspended":0}]}]}}
+
+# 5) 撤销：仅未开始可撤销；已撤销重复调用幂等；已开始/已结束 → 409
+curl -s -X POST $BASE/api/suspensions/1/revoke
+# -> 200 {"id":1,"status":"revoked","phase":"revoked","revocable":false,
+#         "revokedAt":"..."} （历史保留，后续容量立即释放）
+
+# 6) 停用列表 / 单条（列表含已撤销历史）
+curl -s $BASE/api/suspensions
+curl -s $BASE/api/suspensions/1
+```
+
+## 目录结构
+
+```
+src/
+  server.js     Express 服务与路由、原子发布/核验/预约/停用事务
+  db.js         SQLite 连接、建表、数据访问
+  solver.js     求解器、独立复核、数据指纹（纯函数，含测试）
+  verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
+  reserve.js    时段预约与临时停用：UTC 解析、冻结图占用、双层扫描线（占用+停用）
+                容量判定与日程（纯函数，含测试）
+  validate.js   输入校验（非法质量/重复编号/越界）、400/409 错误类型
+public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
+test/           node --test 测试（求解器 + HTTP API + 核验 + 时段预约 + 临时停用，共 81 项）
+Dockerfile / docker-compose.yml
+```
