@@ -148,3 +148,50 @@ export function validateWeights(input, N) {
   if (errors.length) throw new ValidationError(errors);
   return normalized;
 }
+
+// 避邻对（整体替换）：未知编号、自配对、重复配对（含颠倒）任一出现即整次拒绝。
+// 规则为无序集合：每对内部按编号字典序规范化，整体再排序，保证数据指纹稳定。
+export function validateExclusions(input, currentData) {
+  const errors = [];
+  assert(Array.isArray(input), errors, '避邻对列表必须是数组');
+  if (!Array.isArray(input)) throw new ValidationError(errors);
+
+  const tubeIds = new Set(currentData ? currentData.tubes.map((t) => t.id) : []);
+  const seen = new Set();
+  const normalized = [];
+  input.forEach((row, i) => {
+    const where = `第 ${i + 1} 对避邻规则`;
+    assert(row !== null && typeof row === 'object', errors, `${where}格式不正确`);
+    if (!row || typeof row !== 'object') return;
+
+    const a = typeof row.a === 'string' ? row.a.trim() : '';
+    const b = typeof row.b === 'string' ? row.b.trim() : '';
+    assert(a.length > 0, errors, `${where}：离心管编号不能为空`);
+    assert(b.length > 0, errors, `${where}：离心管编号不能为空`);
+    if (!a || !b) return;
+
+    if (a === b) {
+      errors.push(`${where}：离心管「${a}」不能与自身配对（自配对无效）`);
+      return;
+    }
+    for (const id of [a, b]) {
+      if (!tubeIds.has(id)) {
+        errors.push(`${where}：离心管编号「${id}」不存在于当前录入（未知编号）`);
+      }
+    }
+    const lo = a < b ? a : b;
+    const hi = a < b ? b : a;
+    const key = JSON.stringify([lo, hi]);
+    if (seen.has(key)) {
+      errors.push(`避邻对「${lo} ↔ ${hi}」与第 ${i + 1} 对重复（含颠倒顺序的重复）`);
+    }
+    seen.add(key);
+    normalized.push({ a: lo, b: hi });
+  });
+
+  if (errors.length) throw new ValidationError(errors);
+  normalized.sort((x, y) =>
+    x.a < y.a ? -1 : x.a > y.a ? 1 : x.b < y.b ? -1 : x.b > y.b ? 1 : 0,
+  );
+  return normalized;
+}

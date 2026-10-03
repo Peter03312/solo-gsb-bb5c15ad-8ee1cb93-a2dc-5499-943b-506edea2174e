@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS weights (
   quantity INTEGER NOT NULL
 );
 
+-- 离心管避邻对：同对两管不得占据环形相邻孔位（i 与 (i+1)%N 相邻）。
+-- 整体替换维护；对内按编号字典序规范化（tube_a < tube_b），整体按 (tube_a, tube_b)
+-- 排序存储，使规则作为无序集合拥有稳定的数据指纹。
+CREATE TABLE IF NOT EXISTS exclusion_pairs (
+  tube_a TEXT NOT NULL,
+  tube_b TEXT NOT NULL,
+  ord INTEGER NOT NULL,
+  PRIMARY KEY (tube_a, tube_b)
+);
+
 CREATE TABLE IF NOT EXISTS drafts (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   basis_hash TEXT NOT NULL,
@@ -141,12 +151,17 @@ export function loadData(db) {
     .prepare('SELECT mass, quantity FROM weights ORDER BY mass')
     .all()
     .map((w) => ({ mass: w.mass, quantity: w.quantity }));
+  const exclusionPairs = db
+    .prepare('SELECT tube_a, tube_b FROM exclusion_pairs ORDER BY tube_a, tube_b')
+    .all()
+    .map((r) => ({ a: r.tube_a, b: r.tube_b }));
   return {
     holes: N,
     tolerance: cfg.tolerance,
     holeMaxMass,
     tubes,
     weights,
+    exclusionPairs,
   };
 }
 

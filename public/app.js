@@ -14,6 +14,7 @@ let state = null; // GET /api/state 的完整响应
 let editorN = null;
 let tubeRows = []; // {id, mass, holes:Set}
 let weightRows = []; // {mass, quantity}
+let exclRows = []; // 避邻对编辑行：{a, b}（管编号）
 
 // ---------- 通用 ----------
 
@@ -72,11 +73,15 @@ function renderAll() {
         holes: new Set(t.usableHoles),
       }));
       weightRows = d.weights.map((w) => ({ mass: w.mass, quantity: w.quantity }));
+      exclRows = (d.exclusionPairs || []).map((p) => ({ a: p.a, b: p.b }));
+    } else {
+      exclRows = [];
     }
   }
 
   renderHoleMax(d);
   renderTubeTable(N);
+  renderExclusionTable();
   renderWeightTable();
   renderDraft();
   renderPublications();
@@ -174,6 +179,72 @@ $('#add-tube').addEventListener('click', () => {
   const holes = new Set([0]);
   tubeRows.push({ id: '', mass: '', holes });
   renderTubeTable(editorN);
+});
+
+// ---------- 避邻对表 ----------
+
+function tubeIdOptions(selected) {
+  // 下拉选项来自已保存的离心管（服务端按已保存数据校验）；
+  // 当前值不在其中时保留原值并标记（保存时会被服务端拒绝）。
+  const ids = state.data ? state.data.tubes.map((t) => t.id) : [];
+  const opts = ['<option value="">（选择离心管）</option>'];
+  for (const id of ids) {
+    opts.push(
+      `<option value="${escapeHtml(id)}"${id === selected ? ' selected' : ''}>${escapeHtml(id)}</option>`,
+    );
+  }
+  if (selected && !ids.includes(selected)) {
+    opts.push(
+      `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}（未知编号）</option>`,
+    );
+  }
+  return opts.join('');
+}
+
+function renderExclusionTable() {
+  const tbody = $('#exclusions-table tbody');
+  tbody.innerHTML = '';
+  exclRows.forEach((row, i) => {
+    const tr = document.createElement('tr');
+
+    const tdA = document.createElement('td');
+    const selA = document.createElement('select');
+    selA.innerHTML = tubeIdOptions(row.a);
+    selA.addEventListener('change', () => { row.a = selA.value; });
+    tdA.appendChild(selA);
+
+    const tdB = document.createElement('td');
+    const selB = document.createElement('select');
+    selB.innerHTML = tubeIdOptions(row.b);
+    selB.addEventListener('change', () => { row.b = selB.value; });
+    tdB.appendChild(selB);
+
+    const tdDel = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'danger';
+    del.textContent = '删除';
+    del.addEventListener('click', () => { exclRows.splice(i, 1); renderExclusionTable(); });
+    tdDel.appendChild(del);
+
+    tr.append(tdA, tdB, tdDel);
+    tbody.appendChild(tr);
+  });
+}
+
+$('#add-exclusion').addEventListener('click', () => {
+  if (!state.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
+  exclRows.push({ a: '', b: '' });
+  renderExclusionTable();
+});
+
+$('#save-exclusions').addEventListener('click', async () => {
+  try {
+    await api('PUT', '/api/exclusions', exclRows.map((r) => ({ a: r.a, b: r.b })));
+    const r = await api('POST', '/api/solve');
+    await refresh();
+    if (r.feasible) showAlert('避邻对已保存，装载图已按当前数据重算。', 'ok');
+    else showAlert('避邻对已保存，但不存在可行装载图：\n' + r.reasons.join('\n'), 'err');
+  } catch (e) { showAlert(e.message, 'err'); }
 });
 
 // ---------- 配重表 ----------
@@ -326,10 +397,12 @@ function renderDraft() {
     return;
   }
   const r = draft.result;
+  const excl = state.data && state.data.exclusionPairs ? state.data.exclusionPairs : [];
   body.innerHTML = `
     <div class="metrics">
       <div>使用配重块：<b>${r.weightCount}</b> 枚（已最小化）</div>
       <div>各对径差之和：<b>${fmt(r.diffSum)}</b> g（同配重数下已最小化）</div>
+      <div>避邻规则：<b>${excl.length}</b> 对（已纳入求解）</div>
     </div>
     ${arrangementHtml(r)}`;
   pubBtn.disabled = draft.stale;
@@ -396,11 +469,16 @@ async function openPublication(id) {
   const badge = p.usable
     ? '<span class="badge ok">✓ 可用于当前装载</span>'
     : '<span class="badge stale">✗ 不可用于当前装载</span>';
+  const excl = p.config && Array.isArray(p.config.exclusionPairs) ? p.config.exclusionPairs : [];
+  const exclText = excl.length
+    ? `${excl.length} 对：${excl.map((x) => `${x.a} ↔ ${x.b}`).join('，')}`
+        : '未配置（按无规则装载）';
   $('#pub-detail').innerHTML = `
     <div class="actions" style="margin-top:0">${badge}
       <span class="muted">发布时间 ${p.createdAt}</span></div>
     <p class="muted" style="font-family:ui-monospace,monospace;font-size:12px">
       数据依据 sha256:${p.basisHash}</p>
+    <p class="muted">冻结的避邻规则：${escapeHtml(exclText)}</p>
     ${p.feasible
       ? `<div class="metrics">
           <div>配重块：<b>${p.weightCount}</b> 枚</div>
@@ -429,7 +507,7 @@ function renderVerifications() {
   const list = state.verifications || [];
   if (list.length === 0) {
     box.innerHTML =
-      '<div class="muted">尚无核验记录。在第 5 节对可用于当前装载的发布记录点「现场核验此图」即可开始。</div>';
+      '<div class="muted">尚无核验记录。在第 6 节对可用于当前装载的发布记录点「现场核验此图」即可开始。</div>';
     return;
   }
   box.innerHTML = list

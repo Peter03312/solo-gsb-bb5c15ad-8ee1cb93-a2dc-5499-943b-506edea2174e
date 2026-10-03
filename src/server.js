@@ -50,6 +50,7 @@ import {
   validateConfig,
   validateTubes,
   validateWeights,
+  validateExclusions,
 } from './validate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -119,6 +120,18 @@ export function createApp(db) {
         const current = loadData(db);
         const N = current ? current.holes : null;
         const clean = validateTubes(body, N);
+        // 替换离心管不得留下失效避邻对（对中管不再存在）：整次拒绝并保留原数据
+        const ids = new Set(clean.map((t) => t.id));
+        const dangling = (current ? current.exclusionPairs : []).filter(
+          (p) => !ids.has(p.a) || !ids.has(p.b),
+        );
+        if (dangling.length > 0) {
+          throw new ValidationError([
+            '本次离心管替换会使现有避邻对失效（对中离心管不再存在），已拒绝并保留原数据：',
+            ...dangling.map((p) => `避邻对「${p.a} ↔ ${p.b}」`),
+            '请先解除相关避邻对，或保留对应离心管编号',
+          ]);
+        }
         db.prepare('DELETE FROM tube_holes').run();
         db.prepare('DELETE FROM tubes').run();
         const insTube = db.prepare('INSERT INTO tubes (id, mass, ord) VALUES (?, ?, ?)');
@@ -127,6 +140,33 @@ export function createApp(db) {
           insTube.run(t.id, t.mass, i);
           for (const h of t.usableHoles) insHole.run(t.id, h);
         });
+      });
+      tx(req.body);
+      res.json({ ok: true, currentHash: currentHash(db) });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 避邻对（整体替换，事务） ----------
+  // 环形孔位中孔 i 与 (i+1) % N 相邻，同对两管不得相邻。
+  // 未知编号、自配对、重复配对（含颠倒）任一出现即整次拒绝，不留下部分数据。
+
+  app.get('/api/exclusions', (req, res) => {
+    const data = loadData(db);
+    res.json(data ? data.exclusionPairs : []);
+  });
+
+  app.put('/api/exclusions', (req, res, next) => {
+    try {
+      const tx = db.transaction((body) => {
+        const current = loadData(db);
+        const clean = validateExclusions(body, current);
+        db.prepare('DELETE FROM exclusion_pairs').run();
+        const ins = db.prepare(
+          'INSERT INTO exclusion_pairs (tube_a, tube_b, ord) VALUES (?, ?, ?)',
+        );
+        clean.forEach((p, i) => ins.run(p.a, p.b, i));
       });
       tx(req.body);
       res.json({ ok: true, currentHash: currentHash(db) });

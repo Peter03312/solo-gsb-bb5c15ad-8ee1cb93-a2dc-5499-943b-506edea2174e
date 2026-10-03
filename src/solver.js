@@ -5,6 +5,8 @@
 //   每孔最多放置一件物件（一支离心管或一枚配重块），也可留空（质量按 0 计）。
 //   全部离心管必须装入；每个配重质量组有若干枚，每枚最多使用一次。
 //   任一孔内物件质量不得超过该孔最大承重；每对对径孔质量差不得超过容差。
+//   避邻规则：环形孔位中孔 i 与孔 (i+1)%N 相邻；data.exclusionPairs 中同对的
+//   两支离心管不得占据相邻孔位（未配置规则时等价于无此约束）。
 //
 // 优化目标（字典序）：
 //   1) 使用配重块数量最少
@@ -14,6 +16,7 @@
 //      即同分方案优先让小编号离心管占据低编号孔位。
 //
 // 算法：按对径对逐对做动态规划。状态 = 已用离心管位图 + 各配重组已用数量；
+// 有避邻规则时再附加「上一对/第一对放置的避邻相关管身份」（用于相邻与环绕判定）；
 // 同一状态只保留目标三元组 (配重数, 差和, 孔位物件序列前缀) 最优的路径。
 
 import crypto from 'node:crypto';
@@ -41,10 +44,17 @@ export function canonicalData(data) {
   return canon(data);
 }
 
+// 数据指纹：未配置避邻规则（exclusionPairs 为空或缺失）时哈希与不含该字段的
+// 历史数据完全一致——旧发布图仍按原规则判定可用；一旦配置了规则，规则内容
+// 即纳入指纹，规则变化会使旧发布图不可用于当前装载（历史图本身不改写）。
 export function computeHash(data) {
+  const payload = { ...data };
+  if (!Array.isArray(payload.exclusionPairs) || payload.exclusionPairs.length === 0) {
+    delete payload.exclusionPairs;
+  }
   return crypto
     .createHash('sha256')
-    .update(JSON.stringify(canonicalData(data)))
+    .update(JSON.stringify(canonicalData(payload)))
     .digest('hex');
 }
 
@@ -97,6 +107,35 @@ export function solve(data) {
     .sort((a, b) => a.mass - b.mass)
     .map((w, idx) => ({ ...w, g: idx }));
   const G = groups.length;
+
+  // ---------- 避邻规则预处理 ----------
+  // 环形相邻：孔 h 与 (h+1)%N。同对两管不得相邻。
+  // 只有「参与避邻对的管」的身份需要进入 DP 状态（其余管与任何管相邻均可），
+  // 故状态附加维度仅为 (s+1)^4，s 为避邻涉及管数；无规则时 s=0，状态与
+  // 原模型完全一致（零额外开销）。
+  const exclPairs = Array.isArray(data.exclusionPairs) ? data.exclusionPairs : [];
+  const tubeIdx = new Map(tubes.map((t, i) => [t.id, i]));
+  const forbidden = new Set(); // lo * T + hi（管索引对，小在前）
+  const sMembers = new Set();
+  for (const p of exclPairs) {
+    if (!p || typeof p !== 'object') continue;
+    const ia = tubeIdx.get(p.a);
+    const ib = tubeIdx.get(p.b);
+    if (ia === undefined || ib === undefined || ia === ib) continue; // 校验层已拦截，防御
+    forbidden.add(Math.min(ia, ib) * T + Math.max(ia, ib));
+    sMembers.add(ia);
+    sMembers.add(ib);
+  }
+  const sList = [...sMembers].sort((a, b) => a - b); // S 编码 1..s → 管索引
+  const sCode = new Array(T).fill(0); // 管索引 → S 编码（0 = 不参与避邻）
+  sList.forEach((idx, k) => {
+    sCode[idx] = k + 1;
+  });
+  const S1 = sList.length + 1; // 单侧编码种数（含「非避邻物件」0）
+  const pairKeyOf = (x, y) => Math.min(x, y) * T + Math.max(x, y);
+  // 判定：S 编码 code（上一对/第一对留下的物件）与当前管 curIdx 是否构成禁对
+  const clashes = (code, curIdx) =>
+    code > 0 && curIdx >= 0 && forbidden.has(pairKeyOf(sList[code - 1], curIdx));
 
   const reasons = [];
   if (T > N) {
@@ -200,6 +239,9 @@ export function solve(data) {
           diff: Math.abs(fa.mass - fb.mass),
           key: [fa.slot, fb.slot],
           placements,
+          // 避邻判定用：A/B 侧放置的管索引（非管为 -1）
+          ca: fa.kind === 'tube' ? fa.idx : -1,
+          cb: fb.kind === 'tube' ? fb.idx : -1,
         });
       }
     }
@@ -212,7 +254,13 @@ export function solve(data) {
     pairOptions.push(opts);
   }
 
-  // DP：stateKey -> 最优路径
+  // DP：stateKey -> 最优路径。
+  // 状态附加 prevA/prevB（上一对 A/B 侧物件的 S 编码）与 firstA/firstB
+  // （第一对 A/B 侧物件的 S 编码）：处理第 i 对时，孔 i 与孔 i-1、孔 i+m 与
+  // 孔 i+m-1 的相邻关系用 prev 判定；最后一对（i = m-1）时，环绕边
+  // （孔 m-1 ↔ 孔 m、孔 N-1 ↔ 孔 0）用 first 判定。无避邻规则时 S1 = 1，
+  // 编码恒为 0，stateKey 与原模型逐位一致。
+  const FF = S1 * S1;
   let states = new Map();
   states.set(0, {
     mask: 0,
@@ -222,13 +270,26 @@ export function solve(data) {
     diff: 0,
     key: [],
     placements: [],
+    prevA: 0,
+    prevB: 0,
+    firstA: 0,
+    firstB: 0,
   });
 
   for (let i = 0; i < m; i += 1) {
+    const last = i === m - 1;
     const next = new Map();
     for (const st of states.values()) {
       for (const opt of pairOptions[i]) {
         if (st.mask & opt.mask) continue;
+        // 避邻：当前对与上一对的相邻边（孔 i-1 ↔ i、孔 i+m-1 ↔ i+m）
+        if (S1 > 1) {
+          if (clashes(st.prevA, opt.ca) || clashes(st.prevB, opt.cb)) continue;
+          // 环绕边（仅最后一对）：孔 m-1 ↔ 孔 m、孔 N-1 ↔ 孔 0
+          if (last && (clashes(st.firstB, opt.ca) || clashes(st.firstA, opt.cb))) {
+            continue;
+          }
+        }
         let wcode = st.wcode;
         let counts = st.counts;
         let ok = true;
@@ -254,8 +315,17 @@ export function solve(data) {
           diff: st.diff + opt.diff,
           key: st.key.concat(opt.key),
           placements: st.placements.concat(opt.placements),
+          prevA: opt.ca >= 0 ? sCode[opt.ca] : 0,
+          prevB: opt.cb >= 0 ? sCode[opt.cb] : 0,
+          firstA: i === 0 ? (opt.ca >= 0 ? sCode[opt.ca] : 0) : st.firstA,
+          firstB: i === 0 ? (opt.cb >= 0 ? sCode[opt.cb] : 0) : st.firstB,
         };
-        const stateKey = candidate.mask * wbase + wcode;
+        const stateKey =
+          (((candidate.mask * wbase + wcode) * S1 + candidate.prevA) * S1 +
+            candidate.prevB) *
+            FF +
+          candidate.firstA * S1 +
+          candidate.firstB;
         const old = next.get(stateKey);
         if (!old || cmpObjective(candidate, old) < 0) next.set(stateKey, candidate);
       }
@@ -272,6 +342,21 @@ export function solve(data) {
   }
 
   if (!best) {
+    // 无解时说明冲突来源：若忽略避邻规则存在可行图，则冲突来自避邻规则本身
+    if (exclPairs.length > 0) {
+      const relaxed = solve({ ...data, exclusionPairs: [] });
+      if (relaxed.feasible) {
+        return {
+          feasible: false,
+          reasons: [
+            `不存在同时满足避邻规则的装载图：当前 ${exclPairs.length} 对避邻规则（${exclPairs
+              .map((p) => `${p.a} ↔ ${p.b}`)
+              .join('、')}）与装载约束相互冲突`,
+            '忽略避邻规则时存在可行装载图；请调整避邻对或录入数据后重试',
+          ],
+        };
+      }
+    }
     return {
       feasible: false,
       reasons: ['穷举全部放置组合后，不存在满足全部约束的装载图'],
@@ -424,6 +509,27 @@ export function verify(data, arrangement) {
     diffSum += d;
     if (d > tol + EPS) {
       errors.push(`对径孔对（${i} ↔ ${i + m}）质量差 ${d} 超过容差 ${tol}`);
+    }
+  }
+
+  // 避邻复核：同对两管不得占据环形相邻孔位（i 与 (i+1)%N 相邻）
+  const exclPairs = Array.isArray(data.exclusionPairs) ? data.exclusionPairs : [];
+  if (exclPairs.length > 0) {
+    const holeOf = new Map();
+    arrangement.forEach((slot, h) => {
+      if (slot && slot.kind === 'tube') holeOf.set(slot.ref, h);
+    });
+    for (const p of exclPairs) {
+      if (!p || typeof p !== 'object') continue;
+      const ha = holeOf.get(p.a);
+      const hb = holeOf.get(p.b);
+      if (ha === undefined || hb === undefined) continue; // 未装入/未知管已由上文报告
+      const d = (ha - hb + N) % N;
+      if (d === 1 || d === N - 1) {
+        errors.push(
+          `离心管「${p.a}」（孔 ${ha}）与「${p.b}」（孔 ${hb}）占据相邻孔位，违反避邻规则`,
+        );
+      }
     }
   }
 
